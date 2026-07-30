@@ -7,6 +7,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
+from datetime import datetime
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
@@ -204,23 +205,29 @@ def engineer_features(df, is_train=True):
 train_fe = engineer_features(train, is_train=True)
 test_fe = engineer_features(test, is_train=False)
 
-# Combine temporarily to calculate highly accurate group statistics
-all_df = pd.concat([train_fe, test_fe], axis=0).reset_index(drop=True)
+## Combine temporarily to calculate highly accurate group statistics
+#all_df = pd.concat([train_fe, test_fe], axis=0).reset_index(drop=True)
+#
+## Calculate Peer-Relative Features
+#for col in group_cols:
+#    # Mean ARPU per demographic group
+#    all_df[f'{col}_mean_arpu'] = all_df.groupby(col)['arpu'].transform('mean')
+#    all_df[f'arpu_vs_{col}_peers'] = all_df['arpu'] / (all_df[f'{col}_mean_arpu'] + 1e-5)
+#    
+#    # Mean Month 1 Balance per demographic group
+#    all_df[f'{col}_mean_m1_bal'] = all_df.groupby(col)['m1_daily_avg_bal'].transform('mean')
+#    all_df[f'm1_bal_vs_{col}_peers'] = all_df['m1_daily_avg_bal'] / (all_df[f'{col}_mean_m1_bal'] + 1e-5)
+#
+## Split back into train and test flawlessly
+#train_fe = all_df.iloc[:len(train_fe)].copy()
+#test_fe = all_df.iloc[len(train_fe):].copy()
 
-# Calculate Peer-Relative Features
 group_cols = ['segment', 'earning_pattern', 'region']
-for col in group_cols:
-    # Mean ARPU per demographic group
-    all_df[f'{col}_mean_arpu'] = all_df.groupby(col)['arpu'].transform('mean')
-    all_df[f'arpu_vs_{col}_peers'] = all_df['arpu'] / (all_df[f'{col}_mean_arpu'] + 1e-5)
-    
-    # Mean Month 1 Balance per demographic group
-    all_df[f'{col}_mean_m1_bal'] = all_df.groupby(col)['m1_daily_avg_bal'].transform('mean')
-    all_df[f'm1_bal_vs_{col}_peers'] = all_df['m1_daily_avg_bal'] / (all_df[f'{col}_mean_m1_bal'] + 1e-5)
 
-# Split back into train and test flawlessly
-train_fe = all_df.iloc[:len(train_fe)].copy()
-test_fe = all_df.iloc[len(train_fe):].copy()
+for col in group_cols:
+    means = train_fe.groupby(col)['arpu'].mean()
+    train_fe[f'{col}_mean_arpu'] = train_fe[col].map(means)
+    test_fe[f'{col}_mean_arpu'] = test_fe[col].map(means)
 
 INITIAL_FEATURES = [c for c in train_fe.columns if c not in [TARGET, "profile_hash"]]
 
@@ -368,7 +375,7 @@ oof_cb, test_cb, models_cb = train_oof(
 
 print("\n--- Stacking with LogisticRegression ---")
 stack_features = np.column_stack([oof_lgb, oof_xgb, oof_cb])
-stack_model = LogisticRegression(C=1.0, solver="lbfgs", random_state=42, max_iter=1000)
+stack_model = LogisticRegression(C=0.01, solver="lbfgs", random_state=42, max_iter=1000)
 stack_model.fit(stack_features, y)
 
 stack_oof = stack_model.predict_proba(stack_features)[:, 1]
@@ -380,6 +387,15 @@ weighted_oof = 0.4 * oof_lgb + 0.3 * oof_xgb + 0.3 * oof_cb
 w_ll = log_loss(y, weighted_oof)
 w_auc = roc_auc_score(y, weighted_oof)
 print(f"Weighted OOF | LogLoss: {w_ll:.5f} | ROC-AUC: {w_auc:.5f}")
+
+log = pd.DataFrame({
+    "timestamp": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")] * 2,
+    "model": ["stack", "weighted"],
+    "logloss": [stack_ll, w_ll],
+    "roc_auc": [stack_auc, w_auc],
+    "features": [len(FEATURE_COLS), len(FEATURE_COLS)]})
+
+log.to_csv("cv_log.csv", mode="a", header=not pd.io.common.file_exists("cv_log.csv"), index=False)
 
 print("\n--- Generating test predictions ---")
 

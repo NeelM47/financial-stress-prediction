@@ -30,8 +30,8 @@ TARGET = "liquidity_stress_next_30d"
 ID_COL = "ID"
 
 y = train[TARGET].values
-print("Target mean: {:.4f}".format(y.mean()))
-print("Train shape: {}, Test shape: {}".format(train.shape, test.shape))
+#print("Target mean: {:.4f}".format(y.mean()))
+#print("Train shape: {}, Test shape: {}".format(train.shape, test.shape))
 
 cat_cols = ["gender", "region", "smartphone", "segment", "earning_pattern"]
 #print("Missing in train:\n", train.isnull().sum().to_string())
@@ -412,13 +412,13 @@ final_weight_preds = np.clip(final_weight_preds, 1e-5, 1 - 1e-5)
 
 # We will use the Stacker's predictions for submission as it mathematically optimizes LogLoss
 sub["Target"] = final_stack_preds
-sub.to_csv("submission_stacked.csv", index=False)
+sub.to_csv("submissions/submission_stacked.csv", index=False)
 
 # Just in case, let's also save the weighted predictions
 sub["Target"] = final_weight_preds
-sub.to_csv("submission_weighted_safe.csv", index=False)
+sub.to_csv("submissions/submission_weighted_safe.csv", index=False)
 
-print("Saved submission_stacked.csv and submission_weighted_safe.csv - shape:", sub.shape)
+#print("Saved submission_stacked.csv and submission_weighted_safe.csv - shape:", sub.shape)
 #print("Min Pred:", final_weight_preds.min(), "| Max Pred:", final_weight_preds.max())
 #print(sub.head())
 

@@ -149,6 +149,30 @@ def engineer_features(df, is_train=True):
             long_term = df[[m4_col, m5_col, m6_col]].mean(axis=1)
             new_features[f'{prefix}_macd_ratio'] = short_term / (long_term + 1e-5)
 
+    inflow_types = ['deposit', 'received', 'transfer_from_bank']
+    outflow_types = ['withdraw', 'merchantpay', 'paybill', 'mm_send']
+
+    for m in range(1, 7):
+        inflow = np.zeros(len(df))
+        outflow = np.zeros(len(df))
+
+        for t in inflow_types:
+            col = f'm{m}_{t}_total_value'
+            if col in df.columns:
+                inflow += df[col].values
+
+        for t in outflow_types:
+            col = f'm{m}_{t}_total_value'
+            if col in df.columns:
+                outflow += df[col].values
+
+        new_features[f'm{m}_net_cashflow'] = inflow - outflow
+
+        new_features[f'm{m}_cashflow_margin'] = (inflow - outflow) / (inflow + 1e-5)
+
+    cashflow_matrix = np.column_stack([new_features[f'm{m}_net_cashflow'] for m in range(1, 7)])
+    months = np.arange(1, 7).astype(float)
+    new_features['net_cashflow_slope'] = np.array([np.polyfit(months, v, 1)[0] if np.any(v != 0) else 0.0 for v in cashflow_matrix])
 
     df_new = pd.DataFrame(new_features, index=df.index)
     result = pd.concat([df, df_new], axis=1)
@@ -346,10 +370,10 @@ sub["Target"] = final_weight_preds
 sub.to_csv("submission_weighted_safe.csv", index=False)
 
 print("Saved submission_stacked.csv and submission_weighted_safe.csv - shape:", sub.shape)
-print("Min Pred:", final_weight_preds.min(), "| Max Pred:", final_weight_preds.max())
+#print("Min Pred:", final_weight_preds.min(), "| Max Pred:", final_weight_preds.max())
 #print(sub.head())
 
-print("\n--- Top 20 Most Important Features (CatBoost) ---")
+#print("\n--- Top 20 Most Important Features (CatBoost) ---")
 # models_cb[0] is the CatBoost model trained on Fold 1
 importance = models_cb[0].get_feature_importance()
 feat_imp = pd.DataFrame({
@@ -357,4 +381,4 @@ feat_imp = pd.DataFrame({
     'Importance': importance
 }).sort_values('Importance', ascending=False)
 
-print(feat_imp.head(20))
+#print(feat_imp.head(20))

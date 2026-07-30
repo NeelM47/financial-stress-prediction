@@ -33,7 +33,7 @@ print("Target mean: {:.4f}".format(y.mean()))
 print("Train shape: {}, Test shape: {}".format(train.shape, test.shape))
 
 cat_cols = ["gender", "region", "smartphone", "segment", "earning_pattern"]
-print("Missing in train:\n", train.isnull().sum().to_string())
+#print("Missing in train:\n", train.isnull().sum().to_string())
 
 def engineer_features(df, is_train=True):
     df = df.copy()
@@ -141,6 +141,14 @@ def engineer_features(df, is_train=True):
         short_term_bal = bal_vals[:, 0:2].mean(axis=1) # M1 (most recent) and M2
         long_term_bal = bal_vals[:, 3:6].mean(axis=1)  # M4, M5, M6 (oldest)
         new_features['bal_macd_ratio'] = short_term_bal / (long_term_bal + 1e-5)
+    for prefix in ['deposit_total_value', 'withdraw_total_value', 'received_total_value']:
+        m1_col, m2_col = f'm1_{prefix}', f'm2_{prefix}'
+        m4_col, m5_col, m6_col = f'm4_{prefix}', f'm5_{prefix}', f'm6_{prefix}'
+        if all(c in df.columns for c in [m1_col, m2_col, m4_col, m5_col, m6_col]):
+            short_term = df[[m1_col, m2_col]].mean(axis=1)
+            long_term = df[[m4_col, m5_col, m6_col]].mean(axis=1)
+            new_features[f'{prefix}_macd_ratio'] = short_term / (long_term + 1e-5)
+
 
     df_new = pd.DataFrame(new_features, index=df.index)
     result = pd.concat([df, df_new], axis=1)
@@ -206,51 +214,47 @@ def train_oof(model_name, model_fn, model_params, X, y, test_X, splits, cat_feat
     oof_preds = np.zeros(len(X))
     test_preds = np.zeros(len(test_X))
     models = []
-    
+
+    if cat_features is None:
+        cat_features = []
+
     for fold, (tr_idx, val_idx) in enumerate(splits):
         X_tr, X_val = X[tr_idx], X[val_idx]
         y_tr, y_val = y[tr_idx], y[val_idx]
-        
+
         model = model_fn(**model_params)
-        
-        # Apply specific Early Stopping for each model type
+
         if model_name == "lgb":
             model.fit(
-                X_tr, y_tr, 
-                eval_set=[(X_val, y_val)], 
-                callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)]
-            )
+                    X_tr, y_tr,
+                    eval_set=[(X_val, y_val)],
+                    categorical_feature=cat_features,
+                    callbacks=[lgb.early_stopping(100, verbose=False),lgb.log_evaluation(0)]
+                    )
         elif model_name == "xgb":
             model.fit(
-                X_tr, y_tr, 
-                eval_set=[(X_val, y_val)], 
-                verbose=False
-            )
+                    X_tr, y_tr,
+                    eval_set=[(X_val, y_val)],
+                    verbose=False
+                    )
         elif model_name == "cb":
             model.fit(
-                X_tr, y_tr, 
-                eval_set=[(X_val, y_val)], 
-                cat_features=cat_features,
-                verbose=False
-            )
+                    X_tr, y_tr,
+                    eval_set=[(X_val, y_val)],
+                    cat_features=cat_features,
+                    verbose=False
+                    )
 
-        calibrated_model = CalibratedClassifierCV(FrozenEstimator(model), method='isotonic')
-        calibrated_model.fit(X_val, y_val)
-            
-        # OOF Predictions
-        #val_probs = model.predict_proba(X_val)[:, 1]
-        val_probs = calibrated_model.predict_proba(X_val)[:, 1]
+        val_probs = model.predict_proba(X_val)[:, 1]
         oof_preds[val_idx] = val_probs
-        
-        # FIX 3: Predict on Test Set per fold to avoid Stacking Distribution Mismatch
-        #test_preds += model.predict_proba(test_X)[:, 1] / len(splits)
-        test_preds += calibrated_model.predict_proba(test_X)[:, 1] / len(splits)
+
+        test_preds += model.predict_proba(test_X)[:, 1] / len(splits)
         models.append(model)
-        
+
         score = log_loss(y_val, val_probs)
         auc = roc_auc_score(y_val, val_probs)
         print(f" Fold {fold+1} | Logloss: {score:.5f} | ROC-AUC: {auc:.5f}")
-        
+
     return oof_preds, test_preds, models
 
 print("\n--- LightGBM ---")
@@ -323,6 +327,7 @@ print(f"Weighted OOF | LogLoss: {w_ll:.5f} | ROC-AUC: {w_auc:.5f}")
 print("\n--- Generating test predictions ---")
 
 # FIX 3: We no longer do a full retrain! 
+
 # We use the accumulated test predictions directly fed into the stacker.
 test_stack = np.column_stack([test_lgb, test_xgb, test_cb])
 final_stack_preds = stack_model.predict_proba(test_stack)[:, 1]
@@ -330,16 +335,19 @@ final_stack_preds = stack_model.predict_proba(test_stack)[:, 1]
 # Optional Weighted Predictions
 final_weight_preds = 0.4 * test_lgb + 0.3 * test_xgb + 0.3 * test_cb
 
+final_weight_preds = np.clip(final_weight_preds, 1e-5, 1 - 1e-5)
+
 # We will use the Stacker's predictions for submission as it mathematically optimizes LogLoss
 sub["Target"] = final_stack_preds
 sub.to_csv("submission_stacked.csv", index=False)
 
 # Just in case, let's also save the weighted predictions
 sub["Target"] = final_weight_preds
-sub.to_csv("submission_weighted.csv", index=False)
+sub.to_csv("submission_weighted_safe.csv", index=False)
 
-print("Saved submission_stacked.csv and submission_weighted.csv - shape:", sub.shape)
-print(sub.head())
+print("Saved submission_stacked.csv and submission_weighted_safe.csv - shape:", sub.shape)
+print("Min Pred:", final_weight_preds.min(), "| Max Pred:", final_weight_preds.max())
+#print(sub.head())
 
 print("\n--- Top 20 Most Important Features (CatBoost) ---")
 # models_cb[0] is the CatBoost model trained on Fold 1

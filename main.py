@@ -169,6 +169,12 @@ def engineer_features(df, is_train=True):
         new_features[f'm{m}_net_cashflow'] = inflow - outflow
 
         new_features[f'm{m}_cashflow_margin'] = (inflow - outflow) / (inflow + 1e-5)
+        # 3. Cashflow relative to historical revenue
+        new_features[f'm{m}_cashflow_to_arpu'] = new_features[f'm{m}_net_cashflow'] / (df['arpu'] + 1e-5)
+
+    if 'm1_daily_avg_bal' in df.columns:
+        new_features['is_m1_bankrupt'] = (df['m1_daily_avg_bal'] == 0).astype(float)
+        new_features['is_m2_bankrupt'] = (df['m2_daily_avg_bal'] == 0).astype(float)
 
     cashflow_matrix = np.column_stack([new_features[f'm{m}_net_cashflow'] for m in range(1, 7)])
     months = np.arange(1, 7).astype(float)
@@ -373,7 +379,7 @@ print("Saved submission_stacked.csv and submission_weighted_safe.csv - shape:", 
 #print("Min Pred:", final_weight_preds.min(), "| Max Pred:", final_weight_preds.max())
 #print(sub.head())
 
-#print("\n--- Top 20 Most Important Features (CatBoost) ---")
+print("\n--- Top 20 Most Important Features (CatBoost) ---")
 # models_cb[0] is the CatBoost model trained on Fold 1
 importance = models_cb[0].get_feature_importance()
 feat_imp = pd.DataFrame({
@@ -381,4 +387,4 @@ feat_imp = pd.DataFrame({
     'Importance': importance
 }).sort_values('Importance', ascending=False)
 
-#print(feat_imp.head(20))
+print(feat_imp.head(20))

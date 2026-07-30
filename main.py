@@ -74,15 +74,21 @@ def engineer_features(df, is_train=True):
             vals.append(df[c].values if c else np.zeros(len(df)))
         vals = np.column_stack(vals)
         months = np.arange(1, 7).astype(float)
+        #slopes = np.array([np.polyfit(months, v, 1)[0] if np.any(v != 0) else 0.0 for v in vals])
+        #means = vals.mean(axis=1)
+        #stds = vals.std(axis=1)
         slopes = np.array([np.polyfit(months, v, 1)[0] if np.any(v != 0) else 0.0 for v in vals])
         means = vals.mean(axis=1)
         stds = vals.std(axis=1)
+        txn_type, metric = key
+        prefix = f"{txn_type}_{metric}"
+        weights = np.array([6, 5, 4, 3, 2, 1])
+        ema = np.average(vals, axis=1, weights=weights)
+        new_features[f"{prefix}_ema"] = ema
         recent = vals[:, 0]
         oldest = vals[:, 5]
         ratio = np.divide(recent, oldest, out=np.zeros_like(recent, dtype=float), where=oldest != 0)
         zeros = (vals == 0).sum(axis=1)
-        txn_type, metric = key
-        prefix = f"{txn_type}_{metric}"
         new_features[f"{prefix}_slope"] = slopes
         new_features[f"{prefix}_mean"] = means
         new_features[f"{prefix}_std"] = stds 
@@ -216,12 +222,33 @@ for col in group_cols:
 train_fe = all_df.iloc[:len(train_fe)].copy()
 test_fe = all_df.iloc[len(train_fe):].copy()
 
-FEATURE_COLS = [c for c in train_fe.columns if c not in [TARGET, "profile_hash"]]
+INITIAL_FEATURES = [c for c in train_fe.columns if c not in [TARGET, "profile_hash"]]
+
+print("\n--- Running Feature Selection ---")
+
+temp_X = train_fe[INITIAL_FEATURES].copy()
+for c in cat_cols:
+    if c in temp_X.columns:
+        temp_X[c] = temp_X[c].astype('category')
+
+temp_model = lgb.LGBMClassifier(n_estimators=300, learning_rate=0.05, random_state=42, verbose=-1)
+temp_model.fit(temp_X, y)
+
+importance_df = pd.DataFrame({'Feature': INITIAL_FEATURES, 'Importance': temp_model.feature_importances_})
+importance_df = importance_df.sort_values('Importance', ascending=False)
+best_features = importance_df.head(150)['Feature'].tolist()
+
+for c in cat_cols:
+    if c not in best_features and c in INITIAL_FEATURES:
+        best_features.append(c)
+
+print(f"Reduced features from {len(INITIAL_FEATURES)} down to {len(best_features)}")
+
+FEATURE_COLS = best_features 
 X = train_fe[FEATURE_COLS].values
 test_X = test_fe[FEATURE_COLS].values
 groups = train_fe["profile_hash"].values
 
-# FIX 4: Find categorical indices so CatBoost can handle them natively
 cat_indices = [i for i, c in enumerate(FEATURE_COLS) if c in cat_cols]
 
 le_dict = {}

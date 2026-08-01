@@ -1,10 +1,12 @@
 import pandas as pd
 
-tree_sub = pd.read_csv("submissions/submission_stacked.csv")
-dl_sub = pd.read_csv("submissions/submission_dl.csv")
+# Load the two safe submissions you just made
+sub1 = pd.read_csv("submissions/submission_seed_42.csv")
+sub2 = pd.read_csv("submissions/submission_seed_999.csv")
 
-final_blend = tree_sub.copy()
+# Blend them evenly
+final_blend = sub1.copy()
+final_blend['Target'] = (sub1['Target'] + sub2['Target']) / 2.0
 
-final_blend['Target'] = (tree_sub['Target'] * 0.9) + (dl_sub['Target'] * 0.1)
-
-final_blend.to_csv("submission_TREE_DL_BLEND.csv", index=False)
+final_blend.to_csv("submissions/submission_blend.csv", index=False)
+print("Blend completed! Submit this file!")

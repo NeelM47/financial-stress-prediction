@@ -331,14 +331,14 @@ def train_oof(model_name, model_fn, model_params, X, y, test_X, splits, cat_feat
 print("\n--- LightGBM ---")
 lgb_params = {
     "n_estimators": 3000,
-    "learning_rate": 0.03,
-    "max_depth": 7,
-    "num_leaves": 63,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_samples": 20,
-    "reg_alpha": 0.1,
-    "reg_lambda": 0.1,
+    "learning_rate": 0.02375,
+    "max_depth": 10,
+    "num_leaves": 43,
+    "subsample": 0.6135,
+    "colsample_bytree": 0.4006,
+    "min_child_samples": 42,
+    "reg_alpha": 0.0066,
+    "reg_lambda": 0.0270,
     "random_state": CURRENT_SEED,
     "verbose": -1,
     "objective": "binary",
@@ -353,8 +353,8 @@ xgb_params = {
     "n_estimators": 2000,
     "learning_rate": 0.03,
     "max_depth": 7,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
+    "subsample": 0.7,
+    "colsample_bytree": 0.5,
     "min_child_weight": 20,
     "reg_alpha": 0.1,
     "reg_lambda": 0.1,
@@ -369,11 +369,12 @@ oof_xgb, test_xgb, models_xgb = train_oof(
 print("\n--- CatBoost ---")
 cb_params = {
     "iterations": 2000,
-    "learning_rate": 0.03,
+    "learning_rate": 0.025,
     "depth": 7,
     "l2_leaf_reg": 10,
+    "colsample_bylevel": 0.5,
     "random_seed": CURRENT_SEED,
-    "early_stopping_rounds": 100,
+    "early_stopping_rounds": 150,
     "verbose": 0,
 }
 oof_cb, test_cb, models_cb = train_oof(

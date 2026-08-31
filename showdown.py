@@ -1,14 +1,15 @@
 import os, random, warnings, re
 import numpy as np
 import pandas as pd
-import optuna
 from sklearn.model_selection import GroupKFold, KFold
-from sklearn.metrics import log_loss
-import lightgbm as lgb
 from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import log_loss, roc_auc_score
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostClassifier
 
 warnings.filterwarnings("ignore")
-optuna.logging.set_verbosity(optuna.logging.INFO)
+pd.set_option("display.max_columns", 200)
 
 def seed_everything(seed=42):
     random.seed(seed)
@@ -17,36 +18,43 @@ def seed_everything(seed=42):
 
 seed_everything(42)
 
+# ==========================================
+# 1. LOAD & ENGINEER DATA 
+# ==========================================
 print("Loading data...")
 train = pd.read_csv("data/Train.csv")
 test = pd.read_csv("data/Test.csv")
+sub = pd.read_csv("data/SampleSubmission.csv")
 TARGET = "liquidity_stress_next_30d"
+ID_COL = "ID"
 y = train[TARGET].values
-cat_cols = ["gender", "region", "smartphone", "segment", "earning_pattern"]
+cat_cols = ["gender", "region", "smartphone", "segment", "earning_pattern", "demo_fingerprint"]
 
 def engineer_features(df, is_train=True):
     df = df.copy()
-    if "ID" in df.columns: df = df.drop(columns=["ID"])
+    df['demo_fingerprint'] = df['region'].astype(str) + "_" + df['segment'].astype(str) + "_" + df['earning_pattern'].astype(str)
+    if ID_COL in df.columns:
+        df['id_length'] = df[ID_COL].apply(len)
+        df['id_numeric'] = df[ID_COL].apply(lambda x: int(''.join(filter(str.isdigit, x))) if any(char.isdigit() for char in x) else 0)
+        df = df.drop(columns=[ID_COL])
     if is_train and TARGET in df.columns: df = df.drop(columns=[TARGET])
     if is_train: df["profile_hash"] = df["age"].astype(str) + "_" + df["gender"].astype(str) + "_" + df["region"].astype(str)
 
-    temporal_metrics = {}
-    balance_cols = [c for c in df.columns if re.match(r"^m[1-6]_daily_avg_bal$", c)]
-
+    temporal_metrics, balance_cols = {}, []
     for col in df.columns:
+        if re.match(r"^m[1-6]_daily_avg_bal$", col): balance_cols.append(col)
         m = re.match(r"^m([1-6])_([a-z_]+)_(volume|total_value|highest_amount)$", col)
-        if m: temporal_metrics.setdefault((m.group(2), m.group(3)), {}) [int(m.group(1))] = col
+        if m: temporal_metrics.setdefault((m.group(2), m.group(3)), {})[int(m.group(1))] = col
         m2 = re.match(r"^m([1-6])_([a-z_]+)_([a-z_]+)$", col)
         if m2 and m2.group(3) in ("companies", "merchants", "banks", "recipients", "senders", "agents"):
-            temporal_metrics.setdefault((m2.group(2), m2.group(3)), {}) [int(m2.group(1))] = col
+            temporal_metrics.setdefault((m2.group(2), m2.group(3)), {})[int(m2.group(1))] = col
 
     new_features = {}
-
     for key, month_map in temporal_metrics.items():
         vals = np.column_stack([df[month_map.get(m)].values if month_map.get(m) else np.zeros(len(df)) for m in range(1, 7)])
         months = np.arange(1, 7).astype(float)
-
-        prefix = f"{key[0]}_{key[1]}"
+        txn_type, metric = key
+        prefix = f"{txn_type}_{metric}"
         new_features[f"{prefix}_ema"] = np.average(vals, axis=1, weights=np.array([6, 5, 4, 3, 2, 1]))
         new_features[f"{prefix}_slope"] = np.array([np.polyfit(months, v, 1)[0] if np.any(v != 0) else 0.0 for v in vals])
         new_features[f"{prefix}_mean"] = vals.mean(axis=1)
@@ -72,14 +80,12 @@ def engineer_features(df, is_train=True):
             new_features[f"m{m}_wd_ratio"] = np.divide(df[f"m{m}_withdraw_total_value"].values, df[f"m{m}_deposit_total_value"].values, out=np.zeros(len(df)), where=df[f"m{m}_deposit_total_value"].values != 0)
 
     new_features['arpu_to_m1_bal'] = df['arpu'] / (df['m1_daily_avg_bal'] + 1e-5)
-    new_features['arpu_to_m1_withdraw'] = df['arpu'] / (df['m1_withdraw_total_value'] + 1e-5)
     new_features['x_90_d_activity_to_arpu'] = df['x_90_d_activity_rate'] / (df['arpu'] + 1e-5)
 
     if balance_cols:
         new_features['bal_macd_ratio'] = bal_vals[:, 0:2].mean(axis=1) / (bal_vals[:, 3:6].mean(axis=1) + 1e-5)
-
     for prefix in ['deposit_total_value', 'withdraw_total_value', 'received_total_value']:
-        if all(f'm{i}_{prefix}' in df.columns for i in [1, 2, 3, 4, 5, 6]):
+        if all(f'm{i}_{prefix}' in df.columns for i in [1, 2, 4, 5, 6]):
             new_features[f'{prefix}_macd_ratio'] = df[[f'm1_{prefix}', f'm2_{prefix}']].mean(axis=1) / (df[[f'm4_{prefix}', f'm5_{prefix}', f'm6_{prefix}']].mean(axis=1) + 1e-5)
 
     for m in range(1, 7):
@@ -88,11 +94,6 @@ def engineer_features(df, is_train=True):
         if type(inflow) != int:
             new_features[f'm{m}_net_cashflow'] = inflow - outflow
             new_features[f'm{m}_cashflow_margin'] = (inflow - outflow) / (inflow + 1e-5)
-            new_features[f'm{m}_cashflow_to_arpu'] = (inflow - outflow) / (df['arpu'] + 1e-5)
-
-    if 'm1_daily_avg_bal' in df.columns:
-        new_features['is_m1_bankrupt'] = (df['m1_daily_avg_bal'] == 0).astype(float)
-        new_features['is_m2_bankrupt'] = (df['m2_daily_avg_bal'] == 0).astype(float)
 
     cashflow_matrix = np.column_stack([new_features[f'm{m}_net_cashflow'] for m in range(1, 7)])
     new_features['net_cashflow_slope'] = np.array([np.polyfit(np.arange(1, 7).astype(float), v, 1)[0] if np.any(v != 0) else 0.0 for v in cashflow_matrix])
@@ -107,16 +108,18 @@ def engineer_features(df, is_train=True):
             result[f'{prefix}_90d_trend'] = recent_90d / (prior_90d + 1e-5)
             result[f'{prefix}_90d_delta'] = recent_90d - prior_90d
 
-    for m in range(1, 4):
-        if f'm{m}_paybill_total_value' in result.columns and f'm{m}_merchantpay_total_value' in result.columns:
-            result[f'm{m}_paybill_vs_merchant'] = result[f'm{m}_paybill_total_value'] / (result[f'm{m}_merchantpay_total_value'] + 1e-5)
-            result[f'm{m}_withdraw_vs_merchant'] = result[f'm{m}_withdraw_total_value'] / (result[f'm{m}_merchantpay_total_value'] + 1e-5)
+    vol_cols = [f'm{m}_total_volume' for m in range(1, 7)]
+    if all(c in result.columns for c in vol_cols):
+        vol_matrix = result[vol_cols].values
+        months_since_active = np.argmax(vol_matrix > 0, axis=1)
+        months_since_active[~(vol_matrix > 0).any(axis=1)] = 6
+        result['months_since_last_activity'] = months_since_active
 
     for c in cat_cols:
         if c in result.columns: result[c] = result[c].fillna("Missing").astype(str)
     return result
 
-print("Engineering features...")
+print("\n--- Engineering Features ---")
 train_fe = engineer_features(train, is_train=True)
 test_fe = engineer_features(test, is_train=False)
 
@@ -124,41 +127,36 @@ all_df = pd.concat([train_fe, test_fe], axis=0).reset_index(drop=True)
 for col in ['segment', 'earning_pattern', 'region']:
     all_df[f'{col}_mean_arpu'] = all_df.groupby(col)['arpu'].transform('mean')
     all_df[f'arpu_vs_{col}_peers'] = all_df['arpu'] / (all_df[f'{col}_mean_arpu'] + 1e-5)
-    all_df[f'{col}_mean_m1_bal'] = all_df.groupby(col)['m1_daily_avg_bal'].transform('mean')
-    all_df[f'm1_bal_vs_{col}_peers'] = all_df['m1_daily_avg_bal'] / (all_df[f'{col}_mean_m1_bal'] + 1e-5)
-
 train_fe = all_df.iloc[:len(train_fe)].copy()
 test_fe = all_df.iloc[len(train_fe):].copy()
 
+# Target Encoding
+print("--- Applying K-Fold Target Encoding ---")
 train_fe[TARGET] = y
 kf_te = KFold(n_splits=5, shuffle=True, random_state=42)
-for c in cat_cols:
-    train_fe[f'{c}_te'] = np.nan
-    test_fe[f'{c}_te'] = np.nan
+for c in cat_cols: train_fe[f'{c}_te'] = np.nan
 for tr_idx, val_idx in kf_te.split(train_fe):
     X_tr, X_val = train_fe.iloc[tr_idx], train_fe.iloc[val_idx]
-    for c in cat_cols:
-        train_fe.loc[val_idx, f'{c}_te'] = X_val[c].map(X_tr.groupby(c)[TARGET].mean())
-
+    for c in cat_cols: train_fe.loc[val_idx, f'{c}_te'] = X_val[c].map(X_tr.groupby(c)[TARGET].mean())
 for c in cat_cols:
     test_fe[f'{c}_te'] = test_fe[c].map(train_fe.groupby(c)[TARGET].mean())
-    train_fe[f'{c}_te'] = train_fe[f'{c}_te'].fillna(0.1500)
-    test_fe[f'{c}_te'] = test_fe[f'{c}_te'].fillna(0.1500)
+    train_fe[f'{c}_te'].fillna(0.1500, inplace=True)
+    test_fe[f'{c}_te'].fillna(0.1500, inplace=True)
 
+# Pruning
 INITIAL_FEATURES = [c for c in train_fe.columns if c not in [TARGET, "profile_hash"]]
-
-print("Running Feature Selection ...")
+print("--- Running Feature Selection ---")
 temp_X = train_fe[INITIAL_FEATURES].copy()
 for c in cat_cols: temp_X[c] = temp_X[c].astype('category')
 temp_model = lgb.LGBMClassifier(n_estimators=300, learning_rate=0.05, random_state=42, verbose=-1)
 temp_model.fit(temp_X, y)
-importance_df = pd.DataFrame({'Feature': INITIAL_FEATURES, 'Importance': temp_model.feature_importances_}).sort_values('Importance', ascending=False)
-best_features = importance_df.head(200)['Feature'].tolist()
+best_features = pd.DataFrame({'Feature': INITIAL_FEATURES, 'Importance': temp_model.feature_importances_}).sort_values('Importance', ascending=False).head(200)['Feature'].tolist()
 for c in cat_cols:
     if c not in best_features and c in INITIAL_FEATURES: best_features.append(c)
 
-FEATURE_COLS = best_features
+FEATURE_COLS = best_features 
 X = train_fe[FEATURE_COLS].values
+test_X = test_fe[FEATURE_COLS].values
 groups = train_fe["profile_hash"].values
 cat_indices = [i for i, c in enumerate(FEATURE_COLS) if c in cat_cols]
 
@@ -166,61 +164,84 @@ for i, c in enumerate(FEATURE_COLS):
     if c in cat_cols and c in train_fe.columns:
         le = LabelEncoder()
         all_vals = np.unique(np.concatenate([train_fe[c].astype(str).values, test_fe[c].astype(str).values]))
-        le.fit(all_vals)
-        X[:, i] = le.transform(train_fe[c].astype(str).values)
+        X[:, i] = le.fit_transform(train_fe[c].astype(str).values)
+        test_X[:, i] = le.transform(test_fe[c].astype(str).values)
 
 gkf = GroupKFold(n_splits=5)
 splits = list(gkf.split(X, y, groups))
 
-print("\n--- Starting Optuna Hyperparamter Tuning for LightGBM ---")
-def objective(trial):
-    params = {
-            "n_estimators": 1000,
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-            "max_depth": trial.suggest_int("max_depth", 4, 10),
-            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
-            "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
-            "random_state": 42,
-            "verbose": -1,
-            "objective": "binary",
-            "metric": "binary_logloss"
-            }
-
+# ==========================================
+# 2. ISOLATED TRAINING LOOP
+# ==========================================
+def train_isolated(model_name, model_fn, model_params, cat_features=None):
+    print(f"\n--- Training {model_name.upper()} ---")
     oof_preds = np.zeros(len(X))
+    test_preds = np.zeros(len(test_X))
+    cat_features = cat_features or []
+    
     for fold, (tr_idx, val_idx) in enumerate(splits):
         X_tr, X_val = X[tr_idx], X[val_idx]
         y_tr, y_val = y[tr_idx], y[val_idx]
+        model = model_fn(**model_params)
 
-        model = lgb.LGBMClassifier(**params)
-        model.fit(
-                X_tr, y_tr,
-                eval_set=[(X_val, y_val)],
-                categorical_feature=cat_indices,
-                callbacks=[lgb.early_stopping(50, verbose=False)]
-        )
-        oof_preds[val_idx] = model.predict_proba(X_val)[:, 1]
+        if model_name == "lgb":
+            model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], categorical_feature=cat_features, callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)])
+        elif model_name == "xgb":
+            model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+        elif model_name == "cb":
+            model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], cat_features=cat_features, verbose=False)
 
-    return log_loss(y, oof_preds)
+        val_probs = model.predict_proba(X_val)[:, 1]
+        oof_preds[val_idx] = val_probs
+        test_preds += model.predict_proba(test_X)[:, 1] / len(splits)
 
-study = optuna.create_study(direction="minimize")
+    ll_score = log_loss(y, oof_preds)
+    auc_score = roc_auc_score(y, oof_preds)
+    print(f">> {model_name.upper()} Overall OOF | LogLoss: {ll_score:.5f} | ROC-AUC: {auc_score:.5f}")
+    return oof_preds, test_preds, ll_score
 
-study.optimize(objective, n_trials=40)
+# Using the EXACT best parameters Optuna found (No "Slow Burn" distortion)
+lgb_params = {
+    "n_estimators": 3000, "learning_rate": 0.012933, "max_depth": 12, "num_leaves": 34,
+    "subsample": 0.7153, "colsample_bytree": 0.5692, "min_child_samples": 35,
+    "reg_alpha": 0.0435, "reg_lambda": 1.5197, "random_state": 42, "verbose": -1, "objective": "binary"
+}
+oof_lgb, test_lgb, score_lgb = train_isolated("lgb", lgb.LGBMClassifier, lgb_params, cat_features=cat_indices)
 
-print("\n------------")
-print("Optuna Tuning Complete")
-print(f"Best OOF LogLoss: {study.best_value:.5f}")
-print("Best Parameters:")
-for key, value in study.best_params.items():
-    print(f' "{key}": {value},')
-print("\n------------")
+xgb_params = {
+    "n_estimators": 2000, "learning_rate": 0.011291, "max_depth": 9, "subsample": 0.8681,
+    "colsample_bytree": 0.6235, "min_child_weight": 25, "reg_alpha": 0.2149, "reg_lambda": 0.2036,
+    "random_state": 42, "verbosity": 0, "early_stopping_rounds": 100 
+}
+oof_xgb, test_xgb, score_xgb = train_isolated("xgb", xgb.XGBClassifier, xgb_params)
 
+cb_params = {
+    "iterations": 2000, "learning_rate": 0.027079, "depth": 8, "l2_leaf_reg": 16.3477,
+    "colsample_bylevel": 0.9540, "random_seed": 42, "early_stopping_rounds": 100, "verbose": 0
+}
+oof_cb, test_cb, score_cb = train_isolated("cb", CatBoostClassifier, cb_params, cat_features=cat_indices)
 
+# ==========================================
+# 3. SHOWDOWN RESULTS & SAVING
+# ==========================================
+print("\n=========================================")
+print("🏆 MODEL SHOWDOWN RESULTS 🏆")
+print("=========================================")
+print(f"1. LightGBM LogLoss: {score_lgb:.5f}")
+print(f"2. XGBoost  LogLoss: {score_xgb:.5f}")
+print(f"3. CatBoost LogLoss: {score_cb:.5f}")
 
+if not os.path.exists("submissions"):
+    os.makedirs("submissions")
 
-            
+# Save Individual Submissions
+sub["Target"] = np.clip(test_lgb, 1e-5, 1 - 1e-5)
+sub.to_csv("submissions/showdown_lgbm.csv", index=False)
 
+sub["Target"] = np.clip(test_xgb, 1e-5, 1 - 1e-5)
+sub.to_csv("submissions/showdown_xgb.csv", index=False)
 
+sub["Target"] = np.clip(test_cb, 1e-5, 1 - 1e-5)
+sub.to_csv("submissions/showdown_cb.csv", index=False)
+
+print("\nFiles saved: showdown_lgbm.csv, showdown_xgb.csv, showdown_cb.csv")

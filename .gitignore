@@ -4,3 +4,8 @@ data/
 submissions/
 catboost_info/
 *.csv
+data/
+submissions/
+__pycache__/
+.venv/
+*.csv
